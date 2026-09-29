@@ -1,6 +1,9 @@
 package com.dynatrace.easytrade.creditcardorderservice;
 
 import com.dynatrace.easytrade.creditcardorderservice.models.*;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import jakarta.annotation.PreDestroy;
 import java.sql.*;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -28,6 +31,11 @@ public class DatabaseHelper {
     private final String DELETE_CREDIT_CARD_BY_ACCOUNT_ID_QUERY = "DELETE FROM CreditCards WHERE CreditCardOrderId = (SELECT y.Id FROM CreditCardOrders y WHERE y.AccountId = ?)";
     private final String DELETE_ORDER_BY_ACCOUNT_ID_QUERY = "DELETE FROM CreditCardOrders WHERE AccountId = ?";
     private final String GET_ORDER_ID_AND_CURRENT_STATUS = "select x.CreditCardOrderId, x.Status from CreditCardOrderStatus x inner join (select max(Id) Id, CreditCardOrderId from CreditCardOrderStatus group by CreditCardOrderId) y on x.CreditCardOrderId = y.CreditCardOrderId and x.Id = y.Id";
+    // Same "latest status per order" logic as above, but the ORDER_CREATED filter is applied in
+    // SQL so only matching order ids leave the database. The previous approach loaded every
+    // order's current status into memory and filtered in Java, which scans linearly with the
+    // full order history and does not scale.
+    private final String GET_ORDER_IDS_WITH_CURRENT_STATUS = "select x.CreditCardOrderId from CreditCardOrderStatus x inner join (select max(Id) Id, CreditCardOrderId from CreditCardOrderStatus group by CreditCardOrderId) y on x.CreditCardOrderId = y.CreditCardOrderId and x.Id = y.Id where x.Status = ?";
     private static final Logger logger = LoggerFactory.getLogger(DatabaseHelper.class);
 
     public String insertNewOrder(Connection conn, CreditCardOrderRequest request) throws SQLException {
@@ -131,19 +139,16 @@ public class DatabaseHelper {
     }
 
     public List<String> getOrderIdsWithStatusOrderCreated(Connection conn) throws SQLException {
-        PreparedStatement query = conn.prepareStatement(GET_ORDER_ID_AND_CURRENT_STATUS);
-        ResultSet rs = query.executeQuery();
-
-        ArrayList<String> orders = new ArrayList<>();
-        while (rs.next()) {
-            String id = rs.getString(1);
-            String status = rs.getString(2);
-            if (StatusType.valueOf(status.toUpperCase()) == StatusType.ORDER_CREATED) {
-                orders.add(id);
+        try (PreparedStatement query = conn.prepareStatement(GET_ORDER_IDS_WITH_CURRENT_STATUS)) {
+            query.setString(1, StatusType.ORDER_CREATED.getType());
+            try (ResultSet rs = query.executeQuery()) {
+                ArrayList<String> orders = new ArrayList<>();
+                while (rs.next()) {
+                    orders.add(rs.getString(1));
+                }
+                return orders;
             }
         }
-        query.close();
-        return orders;
     }
 
     public void insertNewStatus(String orderId, StatusType statusType) throws SQLException {
@@ -199,8 +204,86 @@ public class DatabaseHelper {
         }
     }
 
+    /**
+     * Pooled data source. Previously every call opened a brand-new physical connection via
+     * {@link DriverManager#getConnection(String)}, which does not survive high concurrency:
+     * connection setup/teardown per operation exhausts SQL Server's connection budget and adds
+     * per-request latency. HikariCP keeps a bounded pool of reusable connections so throughput
+     * scales without unbounded connection churn.
+     *
+     * <p>Lazily initialized so the service still starts when the DB is briefly unavailable, and
+     * so behaviour is unchanged for callers other than the connection source. Guarded by a lock
+     * because both the web request threads and the {@code WorkScheduler} obtain connections.
+     */
+    private volatile HikariDataSource dataSource;
+
+    private HikariDataSource getDataSource() {
+        HikariDataSource local = dataSource;
+        if (local == null) {
+            synchronized (this) {
+                local = dataSource;
+                if (local == null) {
+                    local = buildDataSource();
+                    dataSource = local;
+                }
+            }
+        }
+        return local;
+    }
+
+    private HikariDataSource buildDataSource() {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(System.getenv("MSSQL_CONNECTIONSTRING"));
+        config.setPoolName("credit-card-order-service-pool");
+        // Bounded pool: sized from env with safe defaults so it can be tuned per environment
+        // without a code change. Keep max pool size aligned with the DB's connection budget.
+        config.setMaximumPoolSize(envInt("DB_POOL_MAX_SIZE", 20));
+        config.setMinimumIdle(envInt("DB_POOL_MIN_IDLE", 2));
+        config.setConnectionTimeout(envLong("DB_POOL_CONNECTION_TIMEOUT_MS", 30_000L));
+        config.setIdleTimeout(envLong("DB_POOL_IDLE_TIMEOUT_MS", 600_000L));
+        config.setMaxLifetime(envLong("DB_POOL_MAX_LIFETIME_MS", 1_800_000L));
+        logger.info("Initializing HikariCP connection pool [{}] with maxPoolSize={}, minIdle={}",
+                config.getPoolName(), config.getMaximumPoolSize(), config.getMinimumIdle());
+        return new HikariDataSource(config);
+    }
+
+    private static int envInt(String name, int defaultValue) {
+        String value = System.getenv(name);
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            logger.warn("Invalid integer for env var {}='{}', using default {}", name, value, defaultValue);
+            return defaultValue;
+        }
+    }
+
+    private static long envLong(String name, long defaultValue) {
+        String value = System.getenv(name);
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            logger.warn("Invalid long for env var {}='{}', using default {}", name, value, defaultValue);
+            return defaultValue;
+        }
+    }
+
     public Connection getConnection() throws SQLException {
-        return DriverManager.getConnection(System.getenv("MSSQL_CONNECTIONSTRING"));
+        return getDataSource().getConnection();
+    }
+
+    @PreDestroy
+    public void close() {
+        HikariDataSource local = dataSource;
+        if (local != null && !local.isClosed()) {
+            logger.info("Closing HikariCP connection pool [{}]", local.getPoolName());
+            local.close();
+        }
     }
 
     public Optional<CreditCardOrderStatus> getLastOrderStatusForAccountId(Connection conn, Integer accountId)
