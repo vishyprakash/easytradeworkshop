@@ -28,6 +28,9 @@ dependencies {
 
     implementation 'org.springframework.boot:spring-boot-starter-web'
 
+    // Brings in HikariCP (version managed by the Spring Boot plugin) for pooled JDBC connections.
+    implementation 'org.springframework.boot:spring-boot-starter-jdbc'
+
     implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:3.0.2'
 
 
